@@ -76,6 +76,8 @@ aki chat "Summarize my last commit"
 
 Don't want to build from source? Download the pre-built, signed DMG from **[aki-notch.app](https://aki-notch.app)** — $5 one-time, includes auto-updates and a free trial.
 
+If you build it yourself, well, I suppose you can comment out the licence check :) The $5 licence is there if you want to support the work.
+
 ## License
 
 This project is licensed under the [GNU General Public License v3.0](LICENSE).
