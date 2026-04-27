@@ -1,0 +1,34 @@
+# Build output (from run.sh / xcodebuild with SYMROOT=.build)
+.build/
+
+# Release build staging (from make_dmg.sh)
+.derived-release/
+
+# Xcode DerivedData (if built from Xcode)
+DerivedData/
+
+# DMG output
+*.dmg
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# Xcode user-specific files
+*.xcuserstate
+xcuserdata/
+top_icon.png
+
+# Human space (personal notes — keep directory, exclude content)
+.human_space/*
+!.human_space/.gitkeep
+
+# Private (not in public repo)
+landing_page/
+license-server/
+.agent_space/
+.human_space/
+.zed/
+dmg_assets/
+debug/
+tools/

@@ -1,0 +1,13 @@
+{
+  "triggers": [
+    {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "type": "random",
+      "minIntervalMinutes": 45,
+      "maxIntervalMinutes": 180,
+      "schedule": []
+    }
+  ],
+  "startupGreeting": true,
+  "startupGreetingDelay": 2
+}

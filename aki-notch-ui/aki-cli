@@ -1,0 +1,652 @@
+#!/usr/bin/env swift
+
+//  aki-cli — Command-line companion for the aki-notch-ui macOS app.
+//
+//  Usage:
+//      swift aki-cli <command> [options]
+//
+//  After compiling:
+//      aki <command> [options]
+//
+//  Commands:
+//      notify    Send a notification to the notch
+//      ask       Ask a question (blocks until the user answers)
+//      listen    Wait for the user to compose a message (⌘⇧K)
+//      say       Send a message to the active character
+//      game      Start a mini-game (tic_tac_toe, snake, hangman)
+//      health    Check if the app is running
+//      collapse  Hide the current card
+//      clear     Clear all state
+//      help      Show this help message
+//
+//  Examples:
+//      aki notify "Hello world!"
+//      aki notify "Build done" --name CI --color "#00FF00"
+//      aki ask "Deploy?" --answers "Yes,No,Rollback"
+//      aki ask "What should I name this?" --name Aki --json
+//      aki say "remind me to review the PR at 5pm"
+//      aki game tic_tac_toe
+//      aki game hangman --mode user_guesses --word "SWIFT"
+//      aki listen
+//      aki health
+
+import Foundation
+
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
+
+// MARK: - Version
+
+private let kVersion = "2.0.0"
+
+// MARK: - Constants
+
+private let kDefaultPort: Int = 47037
+private let kDefaultTimeoutSeconds: TimeInterval = 300  // 5 minutes (matches server timeout)
+
+// MARK: - ANSI Colors
+
+private struct C {
+    static let reset = "\u{001B}[0m"
+    static let bold = "\u{001B}[1m"
+    static let dim = "\u{001B}[2m"
+    static let red = "\u{001B}[31m"
+    static let green = "\u{001B}[32m"
+    static let yellow = "\u{001B}[33m"
+    static let blue = "\u{001B}[34m"
+    static let magenta = "\u{001B}[35m"
+    static let cyan = "\u{001B}[36m"
+    static let white = "\u{001B}[37m"
+
+    /// Whether stdout is a TTY (supports ANSI escapes).
+    static let isTTY: Bool = isatty(STDOUT_FILENO) != 0
+
+    /// Wrap text in ANSI escape only if stdout is a TTY.
+    static func styled(_ text: String, _ codes: String...) -> String {
+        guard isTTY else { return text }
+        return codes.joined() + text + reset
+    }
+}
+
+// MARK: - Helpers
+
+/// Write a message to stderr and exit with code 1.
+func die(_ message: String) -> Never {
+    let prefix = C.isTTY ? "\(C.red)\(C.bold)error:\(C.reset) " : "error: "
+    FileHandle.standardError.write(Data("\(prefix)\(message)\n".utf8))
+    exit(1)
+}
+
+/// Write a message to stderr (non-fatal).
+func warn(_ message: String) {
+    let prefix = C.isTTY ? "\(C.yellow)\(C.bold)warning:\(C.reset) " : "warning: "
+    FileHandle.standardError.write(Data("\(prefix)\(message)\n".utf8))
+}
+
+/// Print a string to stdout.
+func out(_ string: String) {
+    print(string)
+}
+
+/// Parse a JSON string and return the value for a given key, or nil.
+func jsonValue(_ body: String, key: String) -> String? {
+    guard let data = body.data(using: .utf8),
+        let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let value = obj[key]
+    else { return nil }
+
+    if let s = value as? String { return s }
+    if let n = value as? NSNumber { return n.stringValue }
+    // For arrays/dicts, re-serialize compactly.
+    if let nested = try? JSONSerialization.data(withJSONObject: value),
+        let s = String(data: nested, encoding: .utf8)
+    {
+        return s
+    }
+    return nil
+}
+
+// MARK: - HTTP Client
+
+/// A minimal, synchronous HTTP client that talks to the local aki-notch-ui API.
+struct AkiClient {
+    let baseURL: String
+    let defaultTimeout: TimeInterval
+
+    init(port: Int, timeout: TimeInterval) {
+        self.baseURL = "http://127.0.0.1:\(port)"
+        self.defaultTimeout = timeout
+    }
+
+    /// Perform a synchronous HTTP request.  Returns `(statusCode, responseBody)`.
+    @discardableResult
+    func request(
+        method: String,
+        path: String,
+        body: Data? = nil,
+        timeout: TimeInterval? = nil
+    ) -> (statusCode: Int, body: String) {
+        let effectiveTimeout = timeout ?? defaultTimeout
+
+        guard let url = URL(string: "\(baseURL)\(path)") else {
+            die("invalid URL: \(baseURL)\(path)")
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.timeoutInterval = effectiveTimeout
+        if let body = body {
+            req.httpBody = body
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var resultData: Data?
+        var resultResponse: HTTPURLResponse?
+        var resultError: Error?
+
+        let task = URLSession.shared.dataTask(with: req) { data, response, error in
+            resultData = data
+            resultResponse = response as? HTTPURLResponse
+            resultError = error
+            semaphore.signal()
+        }
+        task.resume()
+        semaphore.wait()
+
+        if let error = resultError {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain,
+                nsError.code == -1004 || nsError.code == -1022
+            {
+                die(
+                    "cannot connect to aki-notch-ui — is the app running? (port \(url.port ?? kDefaultPort))"
+                )
+            }
+            if nsError.domain == NSURLErrorDomain, nsError.code == -1001 {
+                die("request timed out after \(Int(effectiveTimeout))s")
+            }
+            die("network error: \(error.localizedDescription)")
+        }
+
+        guard let httpResponse = resultResponse else {
+            die("no HTTP response received")
+        }
+
+        let responseBody: String
+        if let data = resultData, !data.isEmpty {
+            responseBody = String(data: data, encoding: .utf8) ?? ""
+        } else {
+            responseBody = ""
+        }
+
+        return (httpResponse.statusCode, responseBody)
+    }
+
+    // MARK: Convenience methods
+
+    func get(_ path: String, timeout: TimeInterval? = nil) -> (statusCode: Int, body: String) {
+        return request(method: "GET", path: path, timeout: timeout)
+    }
+
+    func post(_ path: String, json: [String: Any] = [:], timeout: TimeInterval? = nil) -> (
+        statusCode: Int, body: String
+    ) {
+        let body: Data
+        if json.isEmpty {
+            body = "{}".data(using: .utf8)!
+        } else {
+            guard let data = try? JSONSerialization.data(withJSONObject: json) else {
+                die("failed to encode JSON body")
+            }
+            body = data
+        }
+        return request(method: "POST", path: path, body: body, timeout: timeout)
+    }
+}
+
+// MARK: - Argument Parsing
+
+/// A minimal argument parser for the CLI.
+struct Args {
+    let command: String
+    let positional: [String]
+    private let flags: [String: String]
+
+    init(_ arguments: [String]) {
+        let args = Array(arguments.dropFirst())
+
+        guard let first = args.first, !first.starts(with: "-") else {
+            self.command = "help"
+            self.positional = []
+            self.flags = [:]
+            return
+        }
+
+        self.command = first.lowercased()
+
+        var positional: [String] = []
+        var flags: [String: String] = [:]
+        var i = 1
+        while i < args.count {
+            let arg = args[i]
+            if arg.starts(with: "--") {
+                let key = String(arg.dropFirst(2)).lowercased()
+                if i + 1 < args.count, !args[i + 1].starts(with: "--") {
+                    flags[key] = args[i + 1]
+                    i += 2
+                } else {
+                    flags[key] = "true"
+                    i += 1
+                }
+            } else if arg.starts(with: "-") && arg.count == 2 {
+                let key = String(arg.dropFirst(1)).lowercased()
+                if i + 1 < args.count, !args[i + 1].starts(with: "-") {
+                    flags[key] = args[i + 1]
+                    i += 2
+                } else {
+                    flags[key] = "true"
+                    i += 1
+                }
+            } else {
+                positional.append(arg)
+                i += 1
+            }
+        }
+
+        self.positional = positional
+        self.flags = flags
+    }
+
+    /// Get a named flag value.
+    func flag(_ name: String) -> String? {
+        return flags[name.lowercased()]
+    }
+
+    /// Whether `--json` was passed.
+    var jsonOutput: Bool {
+        return flag("json") == "true"
+    }
+
+    /// Get the port from `--port` / `-p` or the default.
+    var port: Int {
+        if let portStr = flag("port") ?? flag("p") {
+            guard let p = Int(portStr), p > 0, p <= 65535 else {
+                die("invalid port: \(portStr)")
+            }
+            return p
+        }
+        return kDefaultPort
+    }
+
+    /// Get the timeout from `--timeout` / `-t` or the default.
+    var timeout: TimeInterval {
+        if let tStr = flag("timeout") ?? flag("t") {
+            guard let t = Double(tStr), t > 0 else {
+                die("invalid timeout: \(tStr)")
+            }
+            return t
+        }
+        return kDefaultTimeoutSeconds
+    }
+
+    /// The first positional argument, typically the message.
+    var message: String? {
+        return positional.first
+    }
+}
+
+// MARK: - Commands
+
+func cmdHealth(client: AkiClient, args: Args) {
+    let (status, body) = client.get("/health", timeout: 5)
+    if status == 200 {
+        if args.jsonOutput {
+            out(body)
+        } else {
+            let portStr = jsonValue(body, key: "port") ?? "?"
+            let games = jsonValue(body, key: "games") ?? "[]"
+            out(
+                C.styled("●", C.green) + " aki-notch-ui is running on port "
+                    + C.styled(portStr, C.bold))
+            out(C.styled("  games:", C.dim) + " " + games)
+        }
+    } else {
+        die("unexpected response (\(status)): \(body)")
+    }
+}
+
+func cmdNotify(client: AkiClient, args: Args) {
+    guard let message = args.message else {
+        die(
+            "notify requires a message.\n\nUsage: aki notify \"message\" [--name NAME] [--color HEX] [--accent HEX]"
+        )
+    }
+
+    var json: [String: Any] = ["message": message]
+
+    if let name = args.flag("name") { json["name"] = name }
+    if let color = args.flag("color") { json["name_color"] = color }
+    if let accent = args.flag("accent") { json["accent_hex"] = accent }
+    if let imageB64 = args.flag("image-base64") { json["image_base64"] = imageB64 }
+    if let imageURL = args.flag("image-url") { json["image_url"] = imageURL }
+    if let title = args.flag("title") { json["title"] = title }
+    if let chara = args.flag("chara") { json["character"] = chara }
+    if let face = args.flag("face") { json["face"] = face }
+
+    let (status, body) = client.post("/overlay", json: json)
+    if status == 200 {
+        if args.jsonOutput {
+            out(body)
+        } else {
+            out(C.styled("✓", C.green) + " notification sent")
+        }
+    } else {
+        die("server returned \(status): \(body)")
+    }
+}
+
+func cmdAsk(client: AkiClient, args: Args) {
+    guard let message = args.message else {
+        die(
+            "ask requires a message.\n\nUsage: aki ask \"question\" [--answers \"Yes,No\"] [--name NAME] [--color HEX]"
+        )
+    }
+
+    var json: [String: Any] = ["message": message]
+
+    if let name = args.flag("name") { json["name"] = name }
+    if let color = args.flag("color") { json["name_color"] = color }
+    if let accent = args.flag("accent") { json["accent_hex"] = accent }
+    if let title = args.flag("title") { json["title"] = title }
+    if let imageB64 = args.flag("image-base64") { json["image_base64"] = imageB64 }
+    if let imageURL = args.flag("image-url") { json["image_url"] = imageURL }
+    if let chara = args.flag("chara") { json["character"] = chara }
+    if let face = args.flag("face") { json["face"] = face }
+
+    if let answersStr = args.flag("answers") {
+        let answers =
+            answersStr
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        if !answers.isEmpty {
+            json["proposed_answers"] = answers
+        }
+    }
+
+    let (status, body) = client.post("/chat", json: json)
+    if status == 200 {
+        if args.jsonOutput {
+            out(body)
+        } else {
+            let answer = jsonValue(body, key: "answer") ?? ""
+            if answer.isEmpty {
+                warn("user dismissed without answering")
+            } else {
+                out(answer)
+            }
+        }
+    } else if status == 408 {
+        die("request timed out — the user did not answer in time")
+    } else {
+        die("server returned \(status): \(body)")
+    }
+}
+
+func cmdListen(client: AkiClient, args: Args) {
+    let (status, body) = client.get("/listen")
+    if status == 200 {
+        if args.jsonOutput {
+            out(body)
+        } else {
+            let message = jsonValue(body, key: "message") ?? ""
+            if message.isEmpty {
+                warn("compose was cancelled — no message")
+            } else {
+                out(message)
+            }
+        }
+    } else if status == 408 {
+        die("request timed out — no message was composed")
+    } else {
+        die("server returned \(status): \(body)")
+    }
+}
+
+func cmdSay(client: AkiClient, args: Args) {
+    guard let message = args.message else {
+        die("say requires a message.\n\nUsage: aki say \"message\" [--name NAME] [--accent HEX]")
+    }
+
+    var json: [String: Any] = [
+        "message": message,
+        "name": args.flag("name") ?? "You",
+        "accent_hex": args.flag("accent") ?? "#FFFFFF",
+    ]
+    if let color = args.flag("color") { json["name_color"] = color }
+    if let chara = args.flag("chara") { json["character"] = chara }
+    if let face = args.flag("face") { json["face"] = face }
+
+    let (status, body) = client.post("/overlay", json: json)
+    if status == 200 {
+        if args.jsonOutput {
+            out(body)
+        } else {
+            out(C.styled("✓", C.green) + " message sent")
+        }
+    } else {
+        die("server returned \(status): \(body)")
+    }
+}
+
+func cmdGame(client: AkiClient, args: Args) {
+    guard let game = args.message else {
+        die(
+            "game requires a game type.\n\nUsage: aki game <tic_tac_toe|snake|hangman> [--mode MODE] [--word WORD] [--accent HEX]"
+        )
+    }
+
+    let validGames = ["tic_tac_toe", "snake", "hangman"]
+    let normalizedGame = game.lowercased().replacingOccurrences(of: "-", with: "_")
+    guard validGames.contains(normalizedGame) else {
+        die("unknown game '\(game)'. Valid games: \(validGames.joined(separator: ", "))")
+    }
+
+    var json: [String: Any] = ["game": normalizedGame]
+
+    if let accent = args.flag("accent") { json["accent_hex"] = accent }
+    if let chara = args.flag("chara") { json["character"] = chara }
+    if let face = args.flag("face") { json["face"] = face }
+
+    if normalizedGame == "hangman" {
+        if let mode = args.flag("mode") { json["hangman_mode"] = mode }
+        if let word = args.flag("word") { json["hangman_word"] = word }
+    }
+
+    let (status, body) = client.post("/game", json: json)
+    if status == 200 {
+        if args.jsonOutput {
+            out(body)
+        } else {
+            let result = jsonValue(body, key: "result") ?? body
+            out(result)
+        }
+    } else if status == 408 {
+        die("game timed out")
+    } else {
+        die("server returned \(status): \(body)")
+    }
+}
+
+func cmdCollapse(client: AkiClient, args: Args) {
+    let (status, body) = client.post("/collapse")
+    if status == 200 {
+        if args.jsonOutput {
+            out(body)
+        } else {
+            out(C.styled("✓", C.green) + " card collapsed")
+        }
+    } else {
+        die("server returned \(status): \(body)")
+    }
+}
+
+func cmdClear(client: AkiClient, args: Args) {
+    let (status, body) = client.post("/clear")
+    if status == 200 {
+        if args.jsonOutput {
+            out(body)
+        } else {
+            out(C.styled("✓", C.green) + " state cleared")
+        }
+    } else {
+        die("server returned \(status): \(body)")
+    }
+}
+
+
+func cmdCharacters(client: AkiClient, args: Args) {
+    let (status, body) = client.get("/characters", timeout: 5)
+    if status == 200 {
+        if args.jsonOutput {
+            out(body)
+        } else {
+            guard let data = body.data(using: .utf8),
+                let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+            else {
+                out(body)
+                return
+            }
+            if arr.isEmpty {
+                out(C.styled("No characters loaded.", C.dim))
+                return
+            }
+            for char in arr {
+                let name = char["name"] as? String ?? "?"
+                let accent = char["accent_hex"] as? String ?? "#7FD6FF"
+                let faces = (char["faces"] as? [String]) ?? []
+                let faceList = faces.isEmpty ? C.styled("(no faces)", C.dim) : faces.joined(separator: ", ")
+                out(C.styled("●", C.cyan) + " " + C.styled(name, C.bold) + "  " + C.styled(accent, C.dim))
+                out("  faces: " + faceList)
+            }
+        }
+    } else {
+        die("server returned \(status): \(body)")
+    }
+}
+
+func cmdHelp() {
+    let h = C.styled
+    let b = C.bold
+    let d = C.dim
+    let c = C.cyan
+    let y = C.yellow
+
+    let help = """
+        \(h("aki", b)) — CLI companion for aki-notch-ui
+
+        \(h("USAGE:", b))
+            aki <command> [options]
+
+        \(h("COMMANDS:", b))
+            \(h("notify", c))    Send a notification to the notch
+            \(h("ask", c))       Ask a question (blocks until answered)
+            \(h("listen", c))    Wait for user to compose a message (⌘⇧K)
+            \(h("say", c))       Send a message to the notch as the user
+            \(h("game", c))      Start a mini-game (blocks until finished)
+            \(h("characters", c))  List loaded characters and their faces
+            \(h("health", c))    Check if the app is running
+            \(h("collapse", c))  Hide the current card
+            \(h("clear", c))     Clear all state
+            \(h("help", c))      Show this help message
+            \(h("version", c))   Print version
+
+        \(h("GLOBAL OPTIONS:", b))
+            \(h("--port", y)) <PORT>       Override the API port (default: 47037)
+            \(h("--timeout", y)) <SECS>    Request timeout in seconds (default: 300)
+            \(h("--json", y))              Output raw JSON instead of parsed text
+            \(h("--chara", y)) <NAME>     Use a character's face, name & color
+            \(h("--face", y)) <MOOD>      Which face/mood to use (default: first)
+        \(h("NOTIFY:", b))
+            aki notify <message> [\(h("--name", y)) NAME] [\(h("--color", y)) HEX] [\(h("--accent", y)) HEX]
+                                  [\(h("--title", y)) TITLE] [\(h("--image-url", y)) URL]
+                                  [\(h("--image-base64", y)) DATA]
+
+        \(h("ASK:", b))
+            aki ask <message> [\(h("--answers", y)) "A,B,C"] [\(h("--name", y)) NAME] [\(h("--color", y)) HEX]
+                              [\(h("--accent", y)) HEX] [\(h("--title", y)) TITLE]
+
+        \(h("SAY:", b))
+            aki say <message> [\(h("--name", y)) NAME] [\(h("--accent", y)) HEX] [\(h("--color", y)) HEX]
+
+        \(h("GAME:", b))
+            aki game <tic_tac_toe|snake|hangman>
+                     [\(h("--mode", y)) user_guesses|agent_guesses]  \(h("(hangman only)", d))
+                     [\(h("--word", y)) WORD]                        \(h("(hangman only)", d))
+                     [\(h("--accent", y)) HEX]
+
+        \(h("CHARACTER:", b))
+            Use \(h("--chara", y)) with notify, ask, say, or game to show a character:
+            \(h("$", d)) aki notify "Hello!" --chara Aki
+            \(h("$", d)) aki notify "Grr!" --chara Aki --face angry
+            \(h("$", d)) aki ask "Play?" --chara Haruna --answers "Yes,No"
+
+        \(h("EXAMPLES:", b))
+            \(h("$", d)) aki notify "Hello world!"
+            \(h("$", d)) aki notify "Build done" --name CI --color "#00FF00"
+            \(h("$", d)) aki ask "Deploy?" --answers "Yes,No,Rollback"
+            \(h("$", d)) aki ask "Name?" --name Aki --json
+            \(h("$", d)) aki say "remind me to review the PR at 5pm"
+            \(h("$", d)) aki game tic_tac_toe
+            \(h("$", d)) aki game hangman --mode user_guesses
+            \(h("$", d)) aki listen
+            \(h("$", d)) aki health
+            \(h("$", d)) aki collapse
+            \(h("$", d)) aki clear
+            \(h("$", d)) aki characters
+            \(h("$", d)) aki notify "Hello!" --chara Aki --face happy
+
+            \(h("# Scripting — capture the answer:", d))
+            \(h("$", d)) answer=$(aki ask "Continue?" --answers "Yes,No")
+            \(h("$", d)) echo "User said: $answer"
+
+            \(h("# Pipe listen into another command:", d))
+            \(h("$", d)) aki listen | xargs echo "User composed:"
+        """
+    out(help)
+}
+// MARK: - Main
+
+let args = Args(CommandLine.arguments)
+let client = AkiClient(port: args.port, timeout: args.timeout)
+
+switch args.command {
+case "notify", "n":
+    cmdNotify(client: client, args: args)
+case "ask", "a":
+    cmdAsk(client: client, args: args)
+case "listen", "l":
+    cmdListen(client: client, args: args)
+case "say", "s":
+    cmdSay(client: client, args: args)
+case "game", "g":
+    cmdGame(client: client, args: args)
+case "health", "ping":
+    cmdHealth(client: client, args: args)
+case "collapse":
+    cmdCollapse(client: client, args: args)
+case "clear":
+    cmdClear(client: client, args: args)
+case "characters", "chars", "c":
+    cmdCharacters(client: client, args: args)
+case "help", "--help", "-h":
+    cmdHelp()
+case "version", "--version", "-v":
+    out("aki \(kVersion)")
+default:
+    FileHandle.standardError.write(Data("unknown command: \(args.command)\n".utf8))
+    cmdHelp()
+    exit(1)
+}
